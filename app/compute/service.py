@@ -6,6 +6,16 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
+from app.compute.event_repository import (
+    EVENT_LEASE_RENEWED,
+    EVENT_TASK_CLAIMED,
+    EVENT_TASK_COMPLETED,
+    EVENT_TASK_FAILED,
+    EVENT_TASK_INTERVENED,
+    EVENT_TASK_RECOVERED,
+    EVENT_TASK_SUBMITTED,
+)
+from app.compute.event_service import record_task_event
 from app.compute.repository import ComputeRepository
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
@@ -63,12 +73,14 @@ class ComputeOperationsService:
                     raise ConflictError("同一幂等键对应了不同的计算参数")
                 return dict(repository.task_by_id(existing["id"]))
             self._check_quota(repository, payload["requested_by"], now_value)
-            return repository.create_task(
+            task = repository.create_task(
                 template_id=template["id"], project_code=payload["project_code"],
                 requested_by=payload["requested_by"], parameters=parameters,
                 parameter_digest=parameter_digest, priority=payload["priority"],
                 idempotency_key=payload["idempotency_key"], max_attempts=template["max_attempts"], now=now,
             )
+            record_task_event(connection, EVENT_TASK_SUBMITTED, task, {}, now)
+            return task
 
     def list_tasks(self, *, status: str | None = None, project_code: str | None = None, requested_by: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         return self.repository.list_tasks(status=status, project_code=project_code, requested_by=requested_by, limit=max(1, min(limit, 500)))
@@ -97,7 +109,9 @@ class ComputeOperationsService:
             )
             if cursor.rowcount != 1:
                 return None
-            return dict(repository.task_by_id(candidate["id"]))
+            task = dict(repository.task_by_id(candidate["id"]))
+            record_task_event(connection, EVENT_TASK_CLAIMED, task, {"worker_id": worker_id, "lease_expires_at": lease_until, "attempt": task["attempt_count"]}, now)
+            return task
 
     def heartbeat(self, task_id: int, worker_id: str, lease_seconds: int) -> dict[str, Any]:
         now_value = self.clock.now()
@@ -110,7 +124,9 @@ class ComputeOperationsService:
             )
             if cursor.rowcount != 1:
                 raise ConflictError("任务未由当前工作者持有")
-            return dict(ComputeRepository(connection).task_by_id(task_id))
+            task = dict(ComputeRepository(connection).task_by_id(task_id))
+            record_task_event(connection, EVENT_LEASE_RENEWED, task, {"worker_id": worker_id, "lease_expires_at": expires}, now)
+            return task
 
     def complete(self, task_id: int, worker_id: str, result: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
         now = to_storage(self.clock.now())
@@ -122,15 +138,18 @@ class ComputeOperationsService:
             if task["status"] != "running" or task["lease_owner"] != worker_id:
                 raise ConflictError("任务未由当前工作者持有")
             version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM compute_results WHERE task_id=?", (task_id,)).fetchone()[0])
+            result_digest = digest({"result": result, "metrics": metrics})
             connection.execute(
                 "INSERT INTO compute_results(task_id,version,result_json,metrics_json,result_digest,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (task_id, version, json.dumps(result, ensure_ascii=False, sort_keys=True), json.dumps(metrics, ensure_ascii=False, sort_keys=True), digest({"result": result, "metrics": metrics}), worker_id, now),
+                (task_id, version, json.dumps(result, ensure_ascii=False, sort_keys=True), json.dumps(metrics, ensure_ascii=False, sort_keys=True), result_digest, worker_id, now),
             )
             connection.execute(
                 "UPDATE compute_tasks SET status='succeeded',current_result_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
                 (version, now, now, task_id),
             )
-            return dict(repository.task_by_id(task_id))
+            task_after = dict(repository.task_by_id(task_id))
+            record_task_event(connection, EVENT_TASK_COMPLETED, task_after, {"worker_id": worker_id, "result_version": version, "result_digest": result_digest}, now)
+            return task_after
 
     def fail(self, task_id: int, worker_id: str, error_code: str, message: str, retryable: bool) -> dict[str, Any]:
         now_value = self.clock.now()
@@ -150,7 +169,9 @@ class ComputeOperationsService:
                 "UPDATE compute_tasks SET status=?,available_at=?,lease_owner='',lease_expires_at='',last_error_code=?,last_error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?",
                 (status, available, error_code, message[:2000], None if can_retry else now, now, task_id),
             )
-            return dict(repository.task_by_id(task_id))
+            task_after = dict(repository.task_by_id(task_id))
+            record_task_event(connection, EVENT_TASK_FAILED, task_after, {"worker_id": worker_id, "error_code": error_code, "error_message": message[:2000], "retryable": retryable, "requeued": can_retry}, now)
+            return task_after
 
     def cancel(self, task_id: int, actor: str, reason: str, batch_key: str = "") -> dict[str, Any]:
         return self._intervene(task_id, actor, reason, "cancel", batch_key, self._cancel_mutation)
@@ -208,6 +229,7 @@ class ComputeOperationsService:
                 )
                 after = dict(repository.task_by_id(task["id"]))
                 repository.add_intervention(task_id=task["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
+                record_task_event(connection, EVENT_TASK_RECOVERED, after, {"actor": actor, "outcome": "requeued" if status == "queued" else "exhausted", "previous_lease_owner": before["lease_owner"]}, now)
         return {"recovered": recovered, "exhausted": exhausted}
 
     def summary(self) -> dict[str, Any]:
@@ -226,6 +248,7 @@ class ComputeOperationsService:
             mutation(connection, task, now)
             after = dict(repository.task_by_id(task_id))
             repository.add_intervention(task_id=task_id, actor=actor, action=action, reason=reason, before=before, after=after, batch_key=batch_key, now=now)
+            record_task_event(connection, EVENT_TASK_INTERVENED, after, {"actor": actor, "action": action, "reason": reason, "batch_key": batch_key}, now)
             return after
 
     @staticmethod

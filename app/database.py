@@ -293,6 +293,50 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+CREATE TABLE IF NOT EXISTS compute_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL CHECK(event_type IN ('task_submitted','task_claimed','lease_renewed','task_completed','task_failed','task_recovered','task_intervened')),
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    task_version INTEGER NOT NULL,
+    project_code TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_compute_events_task ON compute_events(task_id,id);
+CREATE INDEX IF NOT EXISTS idx_compute_events_filter ON compute_events(project_code,event_type,id);
+CREATE TABLE IF NOT EXISTS compute_event_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    event_types_json TEXT NOT NULL DEFAULT '[]',
+    project_codes_json TEXT NOT NULL DEFAULT '[]',
+    last_ack_event_id INTEGER NOT NULL DEFAULT 0,
+    lease_seconds INTEGER NOT NULL DEFAULT 60 CHECK(lease_seconds BETWEEN 5 AND 3600),
+    max_delivery_attempts INTEGER NOT NULL DEFAULT 5 CHECK(max_delivery_attempts BETWEEN 1 AND 100),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS compute_event_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id INTEGER NOT NULL REFERENCES compute_event_subscriptions(id) ON DELETE CASCADE,
+    event_id INTEGER NOT NULL REFERENCES compute_events(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','leased','acked','dead')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    dead_reason TEXT NOT NULL DEFAULT '',
+    requeue_count INTEGER NOT NULL DEFAULT 0,
+    first_attempt_at TEXT,
+    acked_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(subscription_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_compute_deliveries_status ON compute_event_deliveries(subscription_id,status,lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_compute_deliveries_event ON compute_event_deliveries(event_id);
 '''
 
 PERMISSIONS = [

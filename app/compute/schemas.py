@@ -80,3 +80,34 @@ class BatchOperation(BaseModel):
         if self.operation == "priority" and self.priority is None:
             raise ValueError("批量调整优先级时必须提供 priority")
         return self
+
+
+class SubscriptionUpsert(BaseModel):
+    description: str = Field(default="", max_length=500)
+    event_types: list[str] = Field(default_factory=list, max_length=20)
+    project_codes: list[str] = Field(default_factory=list, max_length=100)
+    lease_seconds: int = Field(default=60, ge=5, le=3600)
+    max_delivery_attempts: int = Field(default=5, ge=1, le=100)
+    start_from: Literal["beginning", "latest"] = "beginning"
+    reset_cursor: bool = False
+
+
+class EventClaim(BaseModel):
+    consumer_id: str = Field(min_length=1, max_length=120)
+    batch_size: int = Field(default=50, ge=1, le=500)
+    lease_seconds: int | None = Field(default=None, ge=5, le=3600)
+
+
+class EventAck(BaseModel):
+    consumer_id: str = Field(min_length=1, max_length=120)
+    event_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+class EventNack(BaseModel):
+    consumer_id: str = Field(min_length=1, max_length=120)
+    event_ids: list[int] = Field(min_length=1, max_length=500)
+    error: str = Field(min_length=1, max_length=2000)
+
+
+class DeadLetterRequeue(BaseModel):
+    event_ids: list[int] = Field(default_factory=list, max_length=500)
